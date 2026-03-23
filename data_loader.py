@@ -4,6 +4,7 @@ import pandas as pd
 NOAA_SPC_TORNADO_CSV_URL = "https://www.spc.noaa.gov/wcm/data/1950-2024_actual_tornadoes.csv"
 
 
+
 def load_tornado_data(
     start_year: int = 1993,
     end_year: int = 2023,
