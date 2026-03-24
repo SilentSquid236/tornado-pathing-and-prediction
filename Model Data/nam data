@@ -1,0 +1,302 @@
+#!/usr/bin/env python3
+"""
+Automated NAM 12km (GDEX d609000) downloader & processor for Tornado Alley.
+HYBRID APPROACH: 
+- Pure Numpy for bulletproof spatial slicing (bypasses missing map projections).
+- MetPy for streamlined meteorological calculations and unit handling.
+"""
+from __future__ import annotations
+
+import datetime
+import json
+import os
+import shutil
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+import cfgrib
+import numpy as np
+import metpy.xarray  # noqa: F401
+import metpy.calc as mpcalc
+import pandas as pd
+import xarray as xr
+from metpy.units import units
+
+# --- CONFIGURATION ---
+SCRIPT_DIR = Path(__file__).resolve().parent
+
+START_DATE = datetime.datetime(2016, 4, 1)
+END_DATE = datetime.datetime(2016, 4, 2)
+HOURS = ["00", "12"]
+
+OUTPUT_DIR = SCRIPT_DIR / "netcdf_output"
+WORK_DIR = SCRIPT_DIR / "_nam_work"
+
+RDA_GDEX_NAM_BASE = "https://data.rda.ucar.edu/d609000"
+OSDF_GDEX_NAM_BASE = "https://osdf-director.osg-htc.org/ncar/gdex/d609000"
+
+# Tornado Alley bounding box (lon_min, lon_max, lat_min, lat_max)
+TORNADO_ALLEY_BOX = (-105.0, -90.0, 30.0, 45.0)
+
+DOWNLOAD_USER_AGENT = "tornado-pathing-bot/1.0 (research)"
+# ----------------------------------------------------------------------------------
+
+def nam_grib_basename(ymd: str, hour_utc: str) -> str:
+    return f"{ymd}.nam.t{hour_utc}z.awphys00.grb2.tm00"
+
+def nam_download_candidate_urls(year: str, ymd: str, hour_utc: str) -> list[str]:
+    fn = nam_grib_basename(ymd, hour_utc)
+    return [
+        f"{RDA_GDEX_NAM_BASE}/{year}/{fn}",
+        f"{OSDF_GDEX_NAM_BASE}/{year}/{fn}",
+    ]
+
+def _first_existing_var(ds: xr.Dataset, names: tuple[str, ...]) -> str | None:
+    for n in names:
+        if n in ds.variables or n in ds.coords or n in ds.data_vars:
+            return n
+    return None
+
+def download_grib(url: str, dest: Path, timeout_s: int = 900) -> None:
+    dest = Path(dest).expanduser().resolve()
+    dest.parent.mkdir(parents=True, exist_ok=True)
+
+    headers = {"User-Agent": DOWNLOAD_USER_AGENT}
+    api_token = os.environ.get("UCAR_API_TOKEN", "").strip()
+    if api_token:
+        headers["Authorization"] = f"Bearer {api_token}"
+
+    request = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_s) as response:
+            with open(dest, "wb") as out:
+                shutil.copyfileobj(response, out, length=1024 * 1024)
+    except urllib.error.HTTPError as e:
+        hint = " Set UCAR_API_TOKEN if this dataset requires authentication." if e.code in (401, 403) and not api_token else ""
+        raise RuntimeError(f"Download failed: HTTP {e.code} {e.reason} for URL: {url}.{hint}") from e
+
+def download_first_working_url(urls: list[str], dest: Path, timeout_s: int = 900) -> str:
+    dest = Path(dest).expanduser().resolve()
+    last_err: Exception | None = None
+    for url in urls:
+        try:
+            download_grib(url, dest, timeout_s=timeout_s)
+            size = dest.stat().st_size
+            
+            if size < 100 * 1024:
+                with open(dest, "r", encoding="utf-8", errors="ignore") as f:
+                    preview = f.read(300)
+                raise RuntimeError(f"Download only {size/1024:.1f} KB; likely an HTML error page. Preview:\n{preview}")
+                
+            with open(dest, "rb") as fh:
+                if fh.read(4) != b"GRIB":
+                    raise RuntimeError("File does not start with GRIB magic.")
+            return url
+        except Exception as e:
+            last_err = e
+            if dest.exists():
+                dest.unlink(missing_ok=True)
+    raise RuntimeError(f"None of {len(urls)} URLs worked. Last error: {last_err}") from last_err
+
+def open_nam_grib_dynamic(path: Path) -> tuple[xr.Dataset, dict]:
+    print("    Scanning internal GRIB layers...")
+    try:
+        # This returns a list of datasets, split by atmospheric levels
+        datasets = cfgrib.open_datasets(str(path))
+    except Exception as e:
+        raise RuntimeError(f"cfgrib failed to parse the file completely: {e}")
+
+    if not datasets:
+        raise RuntimeError(f"cfgrib could not extract any datasets from {path.name}")
+
+    target_vars = {"t2m", "2t", "t", "TMP", "10u", "u10", "UGRD", "10v", "v10", "VGRD"}
+    
+    # Create an empty dataset to hold our combined variables
+    merged_ds = xr.Dataset()
+    found_vars = []
+
+    for ds in datasets:
+        current_vars = set(ds.data_vars.keys())
+        overlap = current_vars.intersection(target_vars)
+        
+        for var in overlap:
+            da = ds[var]
+            
+            # GRIB levels (like 2m vs 10m) cause xarray merge conflicts. 
+            # We drop these specific vertical/time coordinates to force them into one flat 2D map.
+            coords_to_drop = [c for c in ['heightAboveGround', 'step', 'valid_time', 'surface', 'time'] if c in da.coords]
+            clean_da = da.drop_vars(coords_to_drop)
+            
+            merged_ds[var] = clean_da
+            found_vars.append(var)
+            
+        ds.close() # Free up memory as we go
+
+    if not found_vars:
+        print("    Warning: No standard surface temp/wind found. Defaulting to first layer.")
+        return datasets[0], {"fallback": "first_dataset"}
+    
+    print(f"    Successfully extracted and flattened: {found_vars}")
+    return merged_ds, {"extracted_vars": found_vars}
+
+def slice_lonlat_box(ds: xr.Dataset, lon_min: float, lon_max: float, lat_min: float, lat_max: float) -> xr.Dataset:
+    """Uses pure Numpy index masking with robust coordinate detection."""
+    
+    # 1. Clean up coordinates that might interfere with merging/slicing
+    coords_to_drop = [c for c in ["step", "valid_time", "surface", "heightAboveGround"] if c in ds.coords]
+    ds = ds.drop_vars(coords_to_drop, errors="ignore")
+    
+    if "time" in ds.dims and ds.sizes.get("time", 0) >= 1:
+        ds = ds.squeeze("time", drop=True)
+
+    # 2. Robust Coordinate Detection
+    lat_name = _first_existing_var(ds, ("latitude", "lat", "LAT", "nav_lat"))
+    lon_name = _first_existing_var(ds, ("longitude", "lon", "LON", "nav_lon"))
+    
+    if not lat_name or not lon_name:
+        available = list(ds.coords.keys()) + list(ds.data_vars.keys())
+        raise ValueError(f"Could not find lat/lon coordinates. Available fields: {available}")
+
+    # Pull the actual numpy arrays
+    lat = ds[lat_name].values
+    lon = ds[lon_name].values
+    
+    # 3. Handle Longitude convention (Adjust 0-360 to -180 to 180 if needed)
+    if np.any(lon > 180):
+        lon = np.where(lon > 180, lon - 360, lon)
+
+    # 4. Create the Spatial Mask
+    mask = (lat >= lat_min) & (lat <= lat_max) & (lon >= lon_min) & (lon <= lon_max)
+    
+    y_indices, x_indices = np.where(mask)
+    if len(y_indices) == 0:
+        raise ValueError(f"No grid points found inside the box {lon_min, lon_max, lat_min, lat_max}. "
+                         f"Data lat range: {lat.min():.2f} to {lat.max():.2f}")
+
+    # Identify the dimension names (usually 'y' and 'x' or 'lat' and 'lon')
+    y_dim = ds[lat_name].dims[0] 
+    x_dim = ds[lat_name].dims[1]
+
+    # 5. Perform the Slice
+    y_slice = slice(y_indices.min(), y_indices.max() + 1)
+    x_slice = slice(x_indices.min(), x_indices.max() + 1)
+    
+    sub_ds = ds.isel(**{y_dim: y_slice, x_dim: x_slice})
+    
+    # 6. Optional: Zero-out data outside the exact lat/lon boundary 
+    # (Keeps the tensor rectangular but masks the 'curved' edges)
+    sub_mask = mask[y_slice, x_slice]
+    for var in sub_ds.data_vars:
+        sub_ds[var] = sub_ds[var].where(sub_mask, 0.0)
+
+    return sub_ds
+
+def add_wind_speed_if_possible(sub: xr.Dataset) -> xr.Dataset:
+    """Uses MetPy to calculate standardized wind speed from u and v vectors."""
+    u_name = _first_existing_var(sub, ("10u", "u10", "UGRD", "u"))
+    v_name = _first_existing_var(sub, ("10v", "v10", "VGRD", "v"))
+    if u_name is None or v_name is None:
+        return sub
+
+    # Explicitly pull DataArrays and force MetPy parsing
+    u, v = sub[u_name], sub[v_name]
+    
+    try:
+        u_q = u.metpy.quantify()
+        v_q = v.metpy.quantify()
+    except Exception:
+        # Fallback if MetPy couldn't read the unit string naturally
+        u_q = u * units("m/s")
+        v_q = v * units("m/s")
+
+    ws = mpcalc.wind_speed(u_q, v_q)
+    ws_da = ws.metpy.dequantify()
+    ws_da.name = "wind_speed"
+    
+    return sub.assign(wind_speed=ws_da)
+
+def cleanup_grib(path: Path) -> None:
+    if path.exists():
+        path.unlink()
+    for idx_file in path.parent.glob(f"{path.name}*.idx"):
+        idx_file.unlink(missing_ok=True)
+
+def process_one_grib(candidate_urls: list[str], filename: str, ymd: str, hr: str) -> Path:
+    temp_grib = WORK_DIR / filename
+    ds: xr.Dataset | None = None
+    try:
+        used_url = download_first_working_url(candidate_urls, temp_grib)
+        ds, used_filter = open_nam_grib_dynamic(temp_grib)
+        
+        # 1. Spatial Slice (Numpy)
+        sub = slice_lonlat_box(ds, *TORNADO_ALLEY_BOX)
+        
+        # 2. Meteorological Math (MetPy)
+        sub = add_wind_speed_if_possible(sub)
+        
+        # 3. Metadata Mapping
+        sub.attrs["source_url"] = used_url
+        sub.attrs["source_file"] = filename
+        sub.attrs["cfgrib_filter"] = json.dumps(used_filter)
+        
+        valid_time = pd.to_datetime(f"{ymd} {hr}:00:00")
+        sub = sub.expand_dims(time=[valid_time])
+        
+        # Strip any lingering MetPy objects to prevent NetCDF write errors
+        for var in sub.variables:
+            if '_metpy_axis' in sub[var].attrs:
+                del sub[var].attrs['_metpy_axis']
+                
+        output_nc = OUTPUT_DIR / f"tornado_alley_{ymd}_{hr}z.nc"
+        sub.to_netcdf(output_nc)
+        
+        return output_nc
+    finally:
+        if ds is not None:
+            ds.close()
+        cleanup_grib(temp_grib)
+
+def main() -> int:
+    print("Starting NAM → NetCDF pipeline (GDEX d609000).")
+    print(f"NetCDF output directory: {OUTPUT_DIR}")
+
+    WORK_DIR.mkdir(parents=True, exist_ok=True)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    successes = 0
+    failures = 0
+
+    current_date = START_DATE
+    delta = datetime.timedelta(days=1)
+
+    while current_date <= END_DATE:
+        year = current_date.strftime("%Y")
+        ymd = current_date.strftime("%Y%m%d")
+
+        for hr in HOURS:
+            filename = nam_grib_basename(ymd, hr)
+            candidates = nam_download_candidate_urls(year, ymd, hr)
+            print(f"\n---> [{ymd} {hr}z] try:\n    " + "\n    ".join(candidates))
+
+            try:
+                out_path = process_one_grib(candidates, filename, ymd, hr)
+                successes += 1
+                print(f"Success: Saved {out_path.name}")
+            except Exception as e:
+                failures += 1
+                print(f"FAILED {filename}: {e}", file=sys.stderr)
+
+        current_date += delta
+
+    print(f"\nPipeline finished.")
+    print(f"  Successes: {successes}  Failures: {failures}")
+    print(f"  Files saved to: {OUTPUT_DIR}")
+
+    if successes == 0:
+        return 1
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())
