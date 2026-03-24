@@ -1,0 +1,109 @@
+import xarray as xr
+import numpy as np
+import torch
+from torch.utils.data import Dataset, DataLoader
+from pathlib import Path
+
+# --- CONFIGURATION ---
+DATA_DIR = Path("/home/silentsquid236/Documents/Met290/tornado-pathing-and-prediction/Model Data/netcdf_output")
+# List the exact variable names we want to pull from the NetCDF files to act as our "Channels"
+TARGET_VARS = ["wind_speed", "t2m"] 
+
+class TornadoDataset(Dataset):
+    def __init__(self, data_dir, variables, transform=None):
+        """
+        Custom PyTorch Dataset for loading weather NetCDF files.
+        """
+        self.data_dir = Path(data_dir)
+        self.variables = variables
+        self.transform = transform
+        
+        # Grab all the .nc files we generated and sort them chronologically
+        self.files = sorted(list(self.data_dir.glob("*.nc")))
+        
+        if len(self.files) == 0:
+            raise RuntimeError(f"No .nc files found in {self.data_dir}")
+            
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, idx):
+        # 1. Load the specific NetCDF file for this index
+        file_path = self.files[idx]
+        
+        with xr.open_dataset(file_path) as ds:
+            channels = []
+            
+            # 2. Extract each variable as a 2D numpy array
+            for var in self.variables:
+                if var in ds.data_vars:
+                    # squeeze() removes the empty 'time' dimension so we just get a 2D grid
+                    data_2d = ds[var].squeeze().values
+                    
+                    # Replace any missing data (NaNs) with 0 to prevent the math from exploding
+                    data_2d = np.nan_to_num(data_2d, nan=0.0) 
+                    channels.append(data_2d)
+                else:
+                    raise ValueError(f"Variable '{var}' not found in {file_path.name}")
+            
+            # 3. Stack the 2D arrays into a 3D block: Shape becomes (Channels, Height, Width)
+            stacked_data = np.stack(channels, axis=0)
+            
+            # 4. Convert the pure Numpy array into a PyTorch Tensor
+            # We use float32 because that is the standard precision for Deep Learning GPUs
+            tensor_data = torch.tensor(stacked_data, dtype=torch.float32)
+            
+            if self.transform:
+                tensor_data = self.transform(tensor_data)
+                
+            return tensor_data
+
+def get_dataset_stats(dataset):
+    """
+    Calculates the Mean and Standard Deviation across the whole dataset.
+    This is REQUIRED so we can normalize our inputs for the neural network.
+    """
+    print("Scanning dataset to calculate normalization stats...")
+    # Stack all tensors in the dataset to calculate global math
+    all_tensors = torch.stack([dataset[i] for i in range(len(dataset))], dim=0)
+    
+    # Calculate Mean and Std Dev per channel (dim 0 is batch, dim 2 is H, dim 3 is W)
+    mean = all_tensors.mean(dim=[0, 2, 3], keepdim=True)
+    std = all_tensors.std(dim=[0, 2, 3], keepdim=True)
+    
+    return mean, std
+
+def main():
+    # 1. Initialize the raw dataset
+    raw_dataset = TornadoDataset(DATA_DIR, TARGET_VARS)
+    print(f"Successfully loaded dataset with {len(raw_dataset)} weather maps.")
+    
+    # 2. Calculate normalization statistics
+    mean, std = get_dataset_stats(raw_dataset)
+    print(f"Dataset Mean (per channel): {mean.squeeze().tolist()}")
+    print(f"Dataset Std  (per channel): {std.squeeze().tolist()}")
+    
+    # 3. Create a normalization function
+    def normalize_tensor(tensor):
+        # Z-Score Normalization: (X - Mean) / Std
+        return (tensor - mean.squeeze(0)) / (std.squeeze(0) + 1e-7)
+    
+    # 4. Create the final "Ready-for-ML" dataset with the normalizer attached
+    ml_dataset = TornadoDataset(DATA_DIR, TARGET_VARS, transform=normalize_tensor)
+    
+    # 5. Wrap it in a DataLoader (the conveyor belt)
+    # batch_size=2 means it will feed 2 weather maps to the model at a time
+    dataloader = DataLoader(ml_dataset, batch_size=2, shuffle=True)
+    
+    # --- TEST IT ---
+    print("\nTesting the DataLoader conveyor belt...")
+    for batch_idx, batch_data in enumerate(dataloader):
+        print(f"Batch {batch_idx + 1}: Tensor Shape = {batch_data.shape}")
+        
+        # Check the values of the first map in the batch
+        print(f"  -> Min value (normalized): {batch_data[0].min().item():.3f}")
+        print(f"  -> Max value (normalized): {batch_data[0].max().item():.3f}")
+        break # We just want to test the first batch
+
+if __name__ == "__main__":
+    main()

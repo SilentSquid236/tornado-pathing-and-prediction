@@ -1,0 +1,37 @@
+import xarray as xr
+import os
+
+# Define the file path. 
+# If the file is inside the "Model Data" folder, change this to:
+# file_path = "Model Data/tornado_alley_20160401_00z.nc"
+file_path = "Model Data/netcdf_output/tornado_alley_20160401_00z.nc"
+
+def inspect_netcdf(path):
+    # 1. Check if the file actually exists at the given path
+    if not os.path.exists(path):
+        print(f"Error: Could not find '{path}'.")
+        print(f"Current working directory: {os.getcwd()}")
+        print("Tip: If the file is inside a subfolder, make sure to include it in the file_path!")
+        return
+
+    # 2. Open the dataset and print the contents
+    print(f"Successfully found {path}. Inspecting contents...\n")
+    try:
+        ds = xr.open_dataset(path)
+        
+        print("--- Data Variables (Look for your temperature variable here!) ---")
+        for var in ds.data_vars.keys():
+            print(f"  - {var}")
+            
+        print("\n--- Coordinates ---")
+        for coord in ds.coords.keys():
+            print(f"  - {coord}")
+            
+        # Close the dataset to free up memory
+        ds.close()
+        
+    except Exception as e:
+        print(f"An error occurred while trying to read the NetCDF file:\n{e}")
+
+if __name__ == "__main__":
+    inspect_netcdf(file_path)
