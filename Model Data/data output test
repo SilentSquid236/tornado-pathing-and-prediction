@@ -1,3 +1,6 @@
+"""Tests and outputs allvariables found to make sure the data is loaded correctly.
+"""
+
 import xarray as xr
 import os
 

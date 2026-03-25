@@ -1,3 +1,6 @@
+""" Reads and plots a NetCDF file to make sure the data is loaded correctly.
+"""
+
 import xarray as xr
 import matplotlib.pyplot as plt
 import cartopy.crs as ccrs
@@ -6,7 +9,7 @@ from pathlib import Path
 
 # 1. Define the path to one of your new NetCDF files
 # Adjust this filename if you want to look at a different date/time
-nc_file = Path("/home/silentsquid236/Documents/Met290/tornado-pathing-and-prediction/Model Data/netcdf_output/tornado_alley_20160401_00z.nc")
+nc_file = Path("/home/silentsquid236/Documents/GitHub/tornado-pathing-and-prediction/Model Data/netcdf_output/tornado_alley_20160401_12z.nc")
 
 def plot_netcdf_map(filepath):
     print(f"Opening {filepath.name}...")
