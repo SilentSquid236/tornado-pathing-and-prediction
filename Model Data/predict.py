@@ -51,7 +51,7 @@ if __name__ == "__main__":
     WEIGHTS_FILE = Path("Model Data/tornado_predictor_weights.pth")
     
     # Pick ANY single .nc file from your netcdf_output folder to test
-    TEST_MAP = Path("Model Data/netcdf_output/tornado_alley_20160510_12z.nc")
+    TEST_MAP = Path("Model Data/netcdf_output/tornado_alley_20160401_00z.nc")
     
     # Run the prediction
     if TEST_MAP.exists() and WEIGHTS_FILE.exists():

@@ -43,3 +43,19 @@ class TornadoPredictor(nn.Module):
         # 4. Pass the array through the final decision layers
         x = self.classifier(x)
         return x
+
+""" --- QUICK TEST ---
+if __name__ == "__main__":
+    # Create a fake batch of data mimicking your DataLoader output
+    fake_batch = torch.randn(2, 2, 144, 119) 
+    
+    # Initialize the model
+    model = TornadoPredictor(num_channels=2)
+    
+    # Push the fake data through the model
+    predictions = model(fake_batch)
+    
+    print("Model initialized successfully!")
+    print(f"Input Shape:  {fake_batch.shape}")
+    print(f"Output Shape: {predictions.shape}")
+    print(f"Predictions:  {predictions.detach().squeeze().tolist()}")"""

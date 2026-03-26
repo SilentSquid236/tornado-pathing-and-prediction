@@ -51,7 +51,7 @@ def main():
     optimizer = optim.Adam(model.parameters(), lr=0.001)
 
     # --- 4. THE TRAINING LOOP ---
-    epochs = 40 # How many times the model reads the entire textbook
+    epochs = 10 # How many times the model reads the entire textbook
     
     print("\nStarting Training...\n" + "="*30)
     
