@@ -11,6 +11,7 @@ from torch.utils.data import Dataset, DataLoader
 from pathlib import Path
 
 # --- CONFIGURATION ---
+DATA_DIR = Path("Model Data/Model Data/netcdf_output")
 DATA_DIR = Path("/home/silentsquid236/Documents/GitHub/tornado-pathing-and-prediction/Model Data/netcdf_output")
 TARGET_VARS = ["wind_speed", "t2m"] 
 
