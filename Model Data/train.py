@@ -1,92 +1,145 @@
+import os
+import gc
+
+# --- 1. THE AMD HARDWARE FIXES (CRITICAL) ---
+os.environ["HSA_OVERRIDE_GFX_VERSION"] = "11.0.0"
+os.environ["MIOPEN_DEBUG_DISABLE_CUBN"] = "1"
+os.environ["MIOPEN_DEBUG_CONV_GEMM"] = "1"
+os.environ["PYTORCH_HIP_ALLOC_CONF"] = "expandable_segments:True"
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
-from pathlib import Path
 
-# Import your custom classes from your other files
-from dataset_loader import TornadoDataset, get_dataset_stats, DATA_DIR, TARGET_VARS
-from model import TornadoPredictor
+# Disable MIOpen optimization inside Python as a secondary safety net
+torch.backends.cudnn.enabled = False
+torch.backends.cudnn.benchmark = False
+
+# Import your custom classes
+from dataset_loader import TornadoDataset
+from model import TwoStreamTornadoPredictor
 
 def main():
-    # --- 1. SETUP HARDWARE ---
-    # Automatically use the GPU if you have one, otherwise fall back to CPU
+    # --- 2. SETUP HARDWARE ---
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Training on device: {device}")
 
-    # --- 2. SETUP DATA ---
-    TARGET_DATES_FILE = Path("Model Data/target_tornadic_dates.txt")
+    # --- 3. SETUP DATA ---
+    # Ensure this path matches your folder structure exactly
+    tornado_dataset = TornadoDataset(data_dir="Model_Data/Model_Data/netcdf_output")
     
-    # Initialize the raw dataset and get the normalization stats
-    raw_dataset = TornadoDataset(DATA_DIR, TARGET_VARS, TARGET_DATES_FILE)
-    mean, std = get_dataset_stats(raw_dataset)
+    if len(tornado_dataset) == 0:
+        print("Error: No data found! Check your folder paths.")
+        return
+
+    sample_2d, sample_3d, _ = tornado_dataset[0]
     
-    # Create the normalizer function
-    def normalize_tensor(tensor):
-        return (tensor - mean.squeeze(0)) / (std.squeeze(0) + 1e-7)
-    
-    # Create the final DataLoader (Conveyor Belt)
-    ml_dataset = TornadoDataset(DATA_DIR, TARGET_VARS, TARGET_DATES_FILE, transform=normalize_tensor)
-    
-   # --- SCALED UP DATALOADER ---
-    # batch_size=32: Processes 32 maps at a time (lower to 16 if your computer runs out of RAM)
-    # num_workers=4: Uses 4 CPU cores to load files in the background
-    # pin_memory=True: Speeds up the transfer of data from your RAM to your GPU
+    print(f"\nAuto-detected Grid: {sample_2d.shape[1]}x{sample_2d.shape[2]} | Z-Levels: {sample_3d.shape[1]}")
+
+    # DATALOADER: batch_size=1 is required for 8GB VRAM with 3D weather data
     dataloader = DataLoader(
-        ml_dataset, 
-        batch_size=32, 
+        tornado_dataset, 
+        batch_size=8, 
         shuffle=True, 
-        num_workers=4, 
-        pin_memory=True
+        num_workers=0, 
+        pin_memory=False
     )
 
-    # --- 3. SETUP MODEL & LEARNING TOOLS ---
-    model = TornadoPredictor(num_channels=len(TARGET_VARS)).to(device)
+    # --- 4. SETUP MODEL & OPTIMIZER ---
+    model = TwoStreamTornadoPredictor(
+        vars_2d=sample_2d.shape[0], 
+        vars_3d=sample_3d.shape[0], 
+        num_pressure_levels=sample_3d.shape[1], 
+        grid_height=sample_2d.shape[1], 
+        grid_width=sample_2d.shape[2]
+    ).to(device)
     
-    # Binary Cross Entropy Loss: The math function that grades the model's accuracy (0 to 1)
-    criterion = nn.BCELoss() 
+    # ---> THE CLASS IMBALANCE FIX <---
+    # Calculate the exact ratio of empty sky to tornado pixels
+    total_pixels = sample_2d.shape[1] * sample_2d.shape[2]  # e.g., 119 * 144 = 17,136
+    positive_pixels = 9.0  # Your 3x3 tornado hitbox
+    negative_pixels = total_pixels - positive_pixels
+    # 1. DEFINE the raw multiplier first
+    raw_multiplier = negative_pixels / positive_pixels
     
-    # The Optimizer (Adam): The mechanic that updates the model's weights based on the grade
-    # lr = Learning Rate (how big of a step the model takes when adjusting its brain)
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    # 2. CAP it at 50.0 so the AI doesn't panic
+    weight_multiplier = min(raw_multiplier, 50.0)
+    
+    print(f"Applying Class Imbalance Fix: Multiplying tornado pixel loss by {weight_multiplier:.1f}x")
+    
+    # Send the weight to the GPU
+    pos_weight = torch.tensor([weight_multiplier]).to(device)
+    
+    # Initialize loss with the massive penalty for missing tornadoes
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight) 
+    
+    optimizer = optim.Adam(model.parameters(), lr=0.00001)
+    scaler = torch.amp.GradScaler('cuda')
 
-    # --- 4. THE TRAINING LOOP ---
-    epochs = 10 # How many times the model reads the entire textbook
-    
-    print("\nStarting Training...\n" + "="*30)
+    # --- 5. THE TRAINING LOOP ---
+    epochs = 20 
+    print("\nStarting Spatial Training (Map Generation Mode)...\n" + "="*30)
     
     for epoch in range(epochs):
-        model.train() # Tell the model it is in learning mode
+        model.train()
         running_loss = 0.0
+        processed_count = 0
         
-        for batch_idx, (maps, labels) in enumerate(dataloader):
-            # Move the data to your CPU/GPU
-            maps, labels = maps.to(device), labels.to(device)
+        for batch_idx, (t2d, t3d, labels) in enumerate(dataloader):
+            # Move data to RX 7600
+            t2d = t2d.to(device).float()
+            t3d = t3d.to(device).float()
+            labels = labels.to(device).float()
             
-            # Step 1: Zero the gradients (clear the model's memory from the last batch)
-            optimizer.zero_grad()
+            # Normalize on the fly
+            t2d = (t2d - t2d.mean()) / (t2d.std() + 1e-6)
+            t3d = (t3d - t3d.mean()) / (t3d.std() + 1e-6)
+
+            optimizer.zero_grad(set_to_none=True)
             
-            # Step 2: Forward Pass (Make a guess)
-            predictions = model(maps)
+            # Forward Pass with 16-bit Math
+            with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+                predictions = model(t2d, t3d)
+                loss = criterion(predictions, labels)
             
-            # Step 3: Calculate Loss (Grade the guess against the actual labels)
-            loss = criterion(predictions, labels)
+            # Safety check: skip if the NetCDF file was corrupted
+            if torch.isnan(loss):
+                print(f"  Batch [{batch_idx+1}] skipped: Data NaN detected.")
+                continue
+
+            # Backward Pass
+            scaler.scale(loss).backward()
             
-            # Step 4: Backward Pass (Calculate how much to change each brain connection)
-            loss.backward()
+            # Gradient Clipping prevents the math from exploding
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             
-            # Step 5: Optimizer Step (Actually apply the changes to the brain)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             
             running_loss += loss.item()
+            processed_count += 1
             
-        # Calculate the average loss for this epoch
-        avg_loss = running_loss / len(dataloader)
-        print(f"Epoch [{epoch+1}/{epochs}] | Average Loss: {avg_loss:.4f}")
+            # Progress Update
+            if (batch_idx + 1) % 5 == 0 or (batch_idx + 1) == len(dataloader):
+                avg_so_far = running_loss / processed_count if processed_count > 0 else 0
+                print(f"  Batch [{batch_idx+1}/{len(dataloader)}] | Avg Loss: {avg_so_far:.4f}")
+            
+            # Aggressive VRAM Cleanup
+            del t2d, t3d, labels, predictions, loss
+            if batch_idx % 10 == 0:
+                torch.cuda.empty_cache()
+                gc.collect()
 
-    # --- 5. SAVE THE BRAIN ---
-    torch.save(model.state_dict(), "Model Data/tornado_predictor_weights.pth")
-    print("\nTraining Complete! Model saved as 'Model Data/tornado_predictor_weights.pth'")
+        final_avg = running_loss / processed_count if processed_count > 0 else 0
+        print(f"\n✅ Epoch [{epoch+1}/{epochs}] | Final Avg Loss: {final_avg:.4f}\n" + "-"*30)
+
+    # --- 6. SAVE RESULTS ---
+    save_path = "Model_Data/training_data/tornado_predictor_weights.pth"
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    torch.save(model.state_dict(), save_path)
+    print(f"\nTraining Complete! Saved to: {save_path}")
 
 if __name__ == "__main__":
     main()
