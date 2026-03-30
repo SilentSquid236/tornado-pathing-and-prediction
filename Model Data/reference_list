@@ -1,0 +1,330 @@
+#!/usr/bin/env python3
+"""
+Automated NAM 12km (GDEX d609000) downloader & processor for Tornado Alley.
+
+Pulls NAM 12 km **analysis** GRIB2 files for dataset **d609000** (see
+https://gdex.ucar.edu/datasets/d609000/), slices a lon/lat box with MetPy/xarray,
+and **appends** grid points to a master CSV.
+
+**Correct object name** (from the GDEX file browser / OSDF links):
+
+    {yyyymmdd}.nam.t{hh}z.awphys00.grb2.tm00
+
+The script tries, in order:
+
+1. ``https://data.rda.ucar.edu/d609000/{yyyy}/<object>`` (often works without auth
+   for many years; recent years may require ``UCAR_API_TOKEN``).
+2. ``https://osdf-director.osg-htc.org/ncar/gdex/d609000/{yyyy}/<object>`` (OSDF;
+   availability varies by year/cache).
+
+Wrong patterns such as ``nam_12km_...grb2`` or omitting ``.tm00`` return 404.
+
+Authentication:
+  If downloads return 401/403, set ``UCAR_API_TOKEN`` in the environment
+  (UCAR/GDEX personal access token). Never commit tokens to the repository.
+"""
+from __future__ import annotations
+
+import datetime
+import json
+import os
+import shutil
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+import metpy.xarray  # noqa: F401 — registers .metpy accessor
+import metpy.calc as mpcalc
+import pandas as pd
+import xarray as xr
+from metpy.units import units
+from pyproj import Proj
+
+# --- CONFIGURATION (all paths resolved under this script's directory by default) ---
+SCRIPT_DIR = Path(__file__).resolve().parent
+
+# Default window uses dates known to work on open ``data.rda`` (no token).
+# For 2022+, you may need ``UCAR_API_TOKEN`` or URLs copied from GDEX.
+START_DATE = datetime.datetime(2016, 4, 1)
+END_DATE = datetime.datetime(2016, 4, 2)
+HOURS = ["00", "12"]  # 00z and 12z analyses (dataset is 6-hourly: 00/06/12/18)
+
+OUTPUT_CSV = SCRIPT_DIR / "tornado_alley_master.csv"
+WORK_DIR = SCRIPT_DIR / "_nam_work"
+
+RDA_GDEX_NAM_BASE = "https://data.rda.ucar.edu/d609000"
+OSDF_GDEX_NAM_BASE = "https://osdf-director.osg-htc.org/ncar/gdex/d609000"
+
+# Tornado Alley bounding box (lon_min, lon_max, lat_min, lat_max)
+TORNADO_ALLEY_BOX = (-105.0, -90.0, 30.0, 45.0)
+
+DOWNLOAD_USER_AGENT = "tornado-pathing-bot/1.0 (research)"
+# ----------------------------------------------------------------------------------
+
+
+def nam_grib_basename(ymd: str, hour_utc: str) -> str:
+    """Basename as published on GDEX/OSDF (notice trailing ``.tm00``)."""
+    return f"{ymd}.nam.t{hour_utc}z.awphys00.grb2.tm00"
+
+
+def nam_download_candidate_urls(year: str, ymd: str, hour_utc: str) -> list[str]:
+    """Ordered mirrors to try for one analysis time."""
+    fn = nam_grib_basename(ymd, hour_utc)
+    return [
+        f"{RDA_GDEX_NAM_BASE}/{year}/{fn}",
+        f"{OSDF_GDEX_NAM_BASE}/{year}/{fn}",
+    ]
+
+
+def _first_existing_var(ds: xr.Dataset, names: tuple[str, ...]) -> str | None:
+    for n in names:
+        if n in ds.variables or n in ds.data_vars:
+            return n
+    return None
+
+
+def download_grib(url: str, dest: Path, timeout_s: int = 900) -> None:
+    """Stream a GRIB from ``url`` to ``dest``."""
+    dest = Path(dest).expanduser().resolve()
+    dest.parent.mkdir(parents=True, exist_ok=True)
+
+    headers = {"User-Agent": DOWNLOAD_USER_AGENT}
+    api_token = os.environ.get("UCAR_API_TOKEN", "").strip()
+    if api_token:
+        headers["Authorization"] = f"Bearer {api_token}"
+
+    request = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_s) as response:
+            with open(dest, "wb") as out:
+                shutil.copyfileobj(response, out, length=1024 * 1024)
+    except urllib.error.HTTPError as e:
+        hint = ""
+        if e.code in (401, 403) and not api_token:
+            hint = " Set UCAR_API_TOKEN if this dataset requires authentication."
+        raise RuntimeError(
+            f"Download failed: HTTP {e.code} {e.reason} for URL: {url}.{hint}"
+        ) from e
+
+
+def download_first_working_url(urls: list[str], dest: Path, timeout_s: int = 900) -> str:
+    """Try each URL until one produces a non-tiny GRIB; return the URL used."""
+    dest = Path(dest).expanduser().resolve()
+    last_err: Exception | None = None
+    for url in urls:
+        try:
+            download_grib(url, dest, timeout_s=timeout_s)
+            size = dest.stat().st_size
+            if size < 4096:
+                raise RuntimeError(f"Download only {size} bytes; likely not a GRIB (check URL).")
+            with open(dest, "rb") as fh:
+                if fh.read(4) != b"GRIB":
+                    raise RuntimeError("File does not start with GRIB magic.")
+            return url
+        except Exception as e:
+            last_err = e
+            if dest.exists():
+                dest.unlink(missing_ok=True)
+    raise RuntimeError(
+        f"None of {len(urls)} URLs worked. Last error: {last_err}"
+    ) from last_err
+
+
+def open_nam_grib(path: Path) -> tuple[xr.Dataset, dict]:
+    """Open GRIB2 with cfgrib, trying different level filters."""
+    filter_candidates = [
+        {"typeOfLevel": "surface"},
+        {"typeOfLevel": "heightAboveGround", "level": 2},
+        {"typeOfLevel": "heightAboveGround", "level": 10},
+    ]
+    last_err: Exception | None = None
+    for filter_by_keys in filter_candidates:
+        try:
+            ds = xr.open_dataset(path, engine="cfgrib", filter_by_keys=filter_by_keys)
+            return ds, filter_by_keys
+        except Exception as e:
+            last_err = e
+
+    raise RuntimeError(f"Could not open GRIB {path.name} with any known filter.") from last_err
+
+
+def _pyproj_crs_from_dataset(ds: xr.Dataset):
+    """MetPy often exposes CRS on DataArrays, not on the Dataset accessor."""
+    for name in ds.data_vars:
+        try:
+            crs = ds[name].metpy.pyproj_crs
+            if crs is not None:
+                return crs
+        except (AttributeError, ValueError, TypeError):
+            continue
+    raise ValueError(
+        "Could not read a map CRS from this GRIB (try upgrading MetPy or pick another "
+        "cfgrib hypercube). No variable had .metpy.pyproj_crs."
+    )
+
+
+def slice_lonlat_box(
+    ds: xr.Dataset,
+    lon_min: float,
+    lon_max: float,
+    lat_min: float,
+    lat_max: float,
+) -> xr.Dataset:
+    """Subset using projected x/y after MetPy parse_cf."""
+    ds = ds.metpy.parse_cf()
+    if "time" in ds.dims and ds.sizes.get("time", 0) > 1:
+        ds = ds.isel(time=0)
+    elif "time" in ds.dims and ds.sizes.get("time", 0) == 1:
+        ds = ds.squeeze("time", drop=True)
+
+    map_proj = Proj(_pyproj_crs_from_dataset(ds))
+
+    x0, y0 = map_proj(lon_min, lat_min)
+    x1, y1 = map_proj(lon_max, lat_max)
+    x_lo, x_hi = sorted((x0, x1))
+    y_lo, y_hi = sorted((y0, y1))
+
+    x_name = _first_existing_var(ds, ("x", "X")) or "x"
+    y_name = _first_existing_var(ds, ("y", "Y")) or "y"
+
+    if x_name not in ds.dims or y_name not in ds.dims:
+        raise ValueError(
+            f"Expected horizontal dims {x_name!r} and {y_name!r}; got {list(ds.dims)}."
+        )
+
+    return ds.sel(**{x_name: slice(x_lo, x_hi), y_name: slice(y_lo, y_hi)})
+
+
+def add_wind_speed_if_possible(sub: xr.Dataset) -> xr.Dataset:
+    """Compute wind speed from u/v if present."""
+    u_name = _first_existing_var(sub, ("10u", "u10", "UGRD", "u"))
+    v_name = _first_existing_var(sub, ("10v", "v10", "VGRD", "v"))
+    if u_name is None or v_name is None:
+        return sub
+
+    u, v = sub[u_name], sub[v_name]
+    try:
+        u_q = u.metpy.quantify()
+        v_q = v.metpy.quantify()
+    except Exception:
+        u_q = u * units("m/s")
+        v_q = v * units("m/s")
+
+    ws = mpcalc.wind_speed(u_q, v_q)
+    return sub.assign(wind_speed=ws.metpy.dequantify())
+
+
+def dataframe_for_ml(sub: xr.Dataset) -> pd.DataFrame:
+    """Convert to flat table and drop rows with missing temperature (if present)."""
+    temp_name = _first_existing_var(
+        sub,
+        ("t2m", "2t", "t", "TMP", "Temperature", "temperature"),
+    )
+    df = sub.to_dataframe().reset_index()
+
+    if temp_name and temp_name in df.columns:
+        n_before = len(df)
+        df = df.dropna(subset=[temp_name])
+        if df.empty and n_before:
+            # cfgrib surface cubes may lack 2 m T; keep rows so CSV still gets written.
+            df = sub.to_dataframe().reset_index()
+    return df
+
+
+def cleanup_grib(path: Path) -> None:
+    """Remove the GRIB and cfgrib/ecCodes sidecar index files."""
+    if path.exists():
+        path.unlink()
+    for idx_file in path.parent.glob(f"{path.name}*.idx"):
+        idx_file.unlink(missing_ok=True)
+
+
+def process_one_grib(
+    candidate_urls: list[str],
+    filename: str,
+    ymd: str,
+    hr: str,
+    write_header: bool,
+) -> tuple[pd.DataFrame, bool]:
+    """Download one file, subset, append CSV. Returns (dataframe, write_header_for_next_call)."""
+    temp_grib = WORK_DIR / filename
+    ds: xr.Dataset | None = None
+    try:
+        used_url = download_first_working_url(candidate_urls, temp_grib)
+        ds, used_filter = open_nam_grib(temp_grib)
+        sub = slice_lonlat_box(ds, *TORNADO_ALLEY_BOX)
+        sub = add_wind_speed_if_possible(sub)
+        df = dataframe_for_ml(sub)
+        df.insert(0, "source_url", used_url)
+        df.insert(1, "source_file", filename)
+        df.insert(2, "valid_date_utc", ymd)
+        df.insert(3, "valid_hour_utc", f"{hr}00")
+        df.insert(4, "cfgrib_filter", json.dumps(used_filter, sort_keys=True))
+        df.to_csv(OUTPUT_CSV, mode="a", header=write_header, index=False)
+        return df, False
+    finally:
+        if ds is not None:
+            ds.close()
+        cleanup_grib(temp_grib)
+
+
+def main() -> int:
+    print("Starting NAM → CSV pipeline (GDEX d609000; RDA + OSDF mirrors).")
+    print(f"CSV output path: {OUTPUT_CSV}")
+
+    WORK_DIR.mkdir(parents=True, exist_ok=True)
+
+    write_header = not OUTPUT_CSV.exists()
+    total_rows_written = 0
+    successes = 0
+    failures = 0
+
+    current_date = START_DATE
+    delta = datetime.timedelta(days=1)
+
+    while current_date <= END_DATE:
+        year = current_date.strftime("%Y")
+        ymd = current_date.strftime("%Y%m%d")
+
+        for hr in HOURS:
+            filename = nam_grib_basename(ymd, hr)
+            candidates = nam_download_candidate_urls(year, ymd, hr)
+            print(f"\n---> [{ymd} {hr}z] try:\n    " + "\n    ".join(candidates))
+
+            try:
+                df, write_header = process_one_grib(candidates, filename, ymd, hr, write_header)
+                successes += 1
+                total_rows_written += len(df)
+                print(
+                    f"Success: appended {len(df)} rows "
+                    f"(total this run: {total_rows_written})."
+                )
+            except Exception as e:
+                failures += 1
+                print(f"FAILED {filename}: {e}", file=sys.stderr)
+
+        current_date += delta
+
+    print(f"\nPipeline finished.")
+    print(f"  Output file: {OUTPUT_CSV}")
+    print(f"  Successes: {successes}  Failures: {failures}  Rows appended this run: {total_rows_written}")
+
+    if successes == 0:
+        print(
+            "\nNo rows were written. Confirm dates exist on the server, filenames end in "
+            "``.grb2.tm00``, and set UCAR_API_TOKEN if ``data.rda`` returns 401/403 for "
+            "recent years.\nExample object: 20160401.nam.t00z.awphys00.grb2.tm00",
+            file=sys.stderr,
+        )
+        return 1
+
+    if not OUTPUT_CSV.is_file() or OUTPUT_CSV.stat().st_size == 0:
+        print(f"Output CSV missing or empty: {OUTPUT_CSV}", file=sys.stderr)
+        return 1
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
