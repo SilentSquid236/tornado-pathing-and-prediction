@@ -71,25 +71,18 @@ def main():
     # --- 3. GENERATE THE WINDOWS ---
     required_dates, tornadic_dates = generate_date_windows(unique_dates)
     
-    # --- 4. SAVE THE FILES (Using Relative Paths) ---
-    # This looks for "Model Data" inside the folder where you run the script
-    model_data_dir = Path("Model Data")
-    
-    # Safety feature: Create the folder if it doesn't exist
-    model_data_dir.mkdir(parents=True, exist_ok=True)
     
     # Save the files with the newly requested names
-    with open(model_data_dir / "simulator_dates.txt", "w") as f:
+    with open("simulator_dates.txt", "w") as f:
         for d in required_dates:
             f.write(f"{d}\n")
             
-    with open(model_data_dir / "target_tornadic_dates.txt", "w") as f:
+    with open("target_tornadic_dates.txt", "w") as f:
         for d in tornadic_dates:
             f.write(f"{d}\n")
 
     print("\n" + "="*40)
     print(f"Total simulator days to download (9-day windows): {len(required_dates)}")
-    print(f"Files successfully generated in the '{model_data_dir}' directory!")
     print("="*40 + "\n")
 
 if __name__ == "__main__":

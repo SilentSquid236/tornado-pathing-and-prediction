@@ -38,11 +38,13 @@ GRIB_LOCK = threading.Lock()
 SCRIPT_DIR = Path(__file__).resolve().parent
 
 # Safely pointing to the underscore directory
-DATES_FILE = Path("Model_Data/simulator_dates.txt")
+DATES_FILE = Path("simulator_dates.txt")
 HOURS = ["00", "12"]
 
-OUTPUT_DIR = SCRIPT_DIR / "Model_Data" / "netcdf_output"
-WORK_DIR = SCRIPT_DIR / "Model_Data" / "_nam_work"
+# In your data downloader script
+OUTPUT_DIR = os.path.join(SCRIPT_DIR, "nam_output")
+WORK_DIR = os.path.join(SCRIPT_DIR, "nam_output")
+OUTPUT_DIR.mkdir(exist_ok=True)
 
 RDA_GDEX_NAM_BASE = "https://data.rda.ucar.edu/d609000"
 OSDF_GDEX_NAM_BASE = "https://osdf-director.osg-htc.org/ncar/gdex/d609000"
